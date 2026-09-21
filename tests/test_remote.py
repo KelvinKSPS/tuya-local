@@ -15,8 +15,10 @@ from custom_components.tuya_local.const import (
     DOMAIN,
 )
 from custom_components.tuya_local.remote import (
+    ATTR_RF_FREQUENCY,
     CMD_SEND,
     CMD_SEND_RF,
+    DEFAULT_RF_FREQUENCY,
     TuyaLocalRemote,
     async_setup_entry,
 )
@@ -706,3 +708,172 @@ class TestAsyncLearnCommandRfSubdevice:
 
         # async_refresh is called once per poll tick until code arrives
         remote._device.async_refresh.assert_awaited()
+
+
+class TestRfFrequencyParameter:
+    """Tests for the configurable RF frequency parameter (Bug 2 generalisation).
+
+    The ``frequency`` field in ``remote.learn_command`` lets callers specify the
+    RF carrier band used during study mode.  Devices on 315 MHz or 868 MHz bands
+    need to pass the matching value; the default is "433.92" (most common band).
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_frequency_is_433_92(self):
+        """When no frequency is given, study_feq defaults to '433.92'."""
+        remote = _make_remote()
+        remote._storage_loaded = True
+        remote._receive_dp.get_value.side_effect = [None, "RF_CODE"]
+        remote._device.async_refresh = AsyncMock()
+
+        sent = []
+
+        async def capture(dev, val):
+            sent.append(json.loads(val))
+
+        remote._send_dp.async_set_value.side_effect = capture
+
+        with patch("custom_components.tuya_local.remote.persistent_notification"):
+            with patch(
+                "custom_components.tuya_local.remote.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await remote.async_learn_command(
+                    command=["power"],
+                    device="remote1",
+                    alternative=False,
+                    command_type="rf",
+                    # no frequency kwarg — should default to DEFAULT_RF_FREQUENCY
+                )
+
+        start_cmd = sent[0]
+        assert start_cmd["study_feq"] == DEFAULT_RF_FREQUENCY
+
+    @pytest.mark.asyncio
+    async def test_custom_frequency_315_is_forwarded(self):
+        """Passing frequency='315' sends study_feq='315' to the hub."""
+        remote = _make_remote()
+        remote._storage_loaded = True
+        remote._receive_dp.get_value.side_effect = [None, "RF_CODE"]
+        remote._device.async_refresh = AsyncMock()
+
+        sent = []
+
+        async def capture(dev, val):
+            sent.append(json.loads(val))
+
+        remote._send_dp.async_set_value.side_effect = capture
+
+        with patch("custom_components.tuya_local.remote.persistent_notification"):
+            with patch(
+                "custom_components.tuya_local.remote.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await remote.async_learn_command(
+                    command=["power"],
+                    device="remote1",
+                    alternative=False,
+                    command_type="rf",
+                    frequency="315",
+                )
+
+        start_cmd = sent[0]
+        assert start_cmd["study_feq"] == "315"
+
+    @pytest.mark.asyncio
+    async def test_custom_frequency_868_is_forwarded(self):
+        """Passing frequency='868' sends study_feq='868' to the hub."""
+        remote = _make_remote()
+        remote._storage_loaded = True
+        remote._receive_dp.get_value.side_effect = [None, "RF_CODE"]
+        remote._device.async_refresh = AsyncMock()
+
+        sent = []
+
+        async def capture(dev, val):
+            sent.append(json.loads(val))
+
+        remote._send_dp.async_set_value.side_effect = capture
+
+        with patch("custom_components.tuya_local.remote.persistent_notification"):
+            with patch(
+                "custom_components.tuya_local.remote.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await remote.async_learn_command(
+                    command=["power"],
+                    device="remote1",
+                    alternative=False,
+                    command_type="rf",
+                    frequency="868",
+                )
+
+        start_cmd = sent[0]
+        assert start_cmd["study_feq"] == "868"
+
+    @pytest.mark.asyncio
+    async def test_frequency_propagated_to_both_start_and_exit_commands(self):
+        """Both rf_study and rfstudy_exit must carry the same study_feq value."""
+        remote = _make_remote()
+        remote._storage_loaded = True
+        remote._receive_dp.get_value.side_effect = [None, "RF_CODE"]
+        remote._device.async_refresh = AsyncMock()
+
+        sent = []
+
+        async def capture(dev, val):
+            sent.append(json.loads(val))
+
+        remote._send_dp.async_set_value.side_effect = capture
+
+        with patch("custom_components.tuya_local.remote.persistent_notification"):
+            with patch(
+                "custom_components.tuya_local.remote.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await remote.async_learn_command(
+                    command=["ch1"],
+                    device="remote1",
+                    alternative=False,
+                    command_type="rf",
+                    frequency="315",
+                )
+
+        # sent[0] = rf_study start, sent[-1] = rfstudy_exit
+        assert sent[0]["study_feq"] == "315", "start command must carry the frequency"
+        assert sent[-1]["study_feq"] == "315", "exit command must carry the frequency"
+
+    @pytest.mark.asyncio
+    async def test_ir_learn_ignores_frequency_parameter(self):
+        """IR learning must not be affected by the frequency parameter."""
+        remote = _make_remote()
+        remote._storage_loaded = True
+        remote._receive_dp.get_value.side_effect = [None, "IR_CODE"]
+        remote._device.async_refresh = AsyncMock()
+
+        sent_values = []
+
+        async def capture(dev, val):
+            sent_values.append(val)
+
+        remote._send_dp.async_set_value.side_effect = capture
+
+        with patch("custom_components.tuya_local.remote.persistent_notification"):
+            with patch(
+                "custom_components.tuya_local.remote.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await remote.async_learn_command(
+                    command=["power"],
+                    device="tv",
+                    alternative=False,
+                    # IR — frequency should be silently ignored
+                    frequency="868",
+                )
+
+        # For IR, the study command is plain JSON without study_feq
+        for val in sent_values:
+            parsed = json.loads(val)
+            assert "study_feq" not in parsed, (
+                "IR study command must not contain study_feq"
+            )

@@ -73,10 +73,17 @@ SERVICE_SEND_SCHEMA = COMMAND_SCHEMA.extend(
         vol.Optional(ATTR_DELAY_SECS, default=DEFAULT_DELAY_SECS): vol.Coerce(float),
     }
 )
+ATTR_RF_FREQUENCY = "frequency"
+# Default RF carrier frequency used when none is specified.  433.92 MHz is the
+# most common sub-GHz band for home-automation remotes worldwide.  Pass a
+# different value (e.g. "315", "868") when your device uses another band.
+DEFAULT_RF_FREQUENCY = "433.92"
+
 SERVICE_LEARN_SCHEMA = COMMAND_SCHEMA.extend(
     {
         vol.Required(ATTR_DEVICE): vol.All(cv.string, vol.Length(min=1)),
         vol.Optional(ATTR_ALTERNATIVE, default=False): cv.boolean,
+        vol.Optional(ATTR_RF_FREQUENCY, default=DEFAULT_RF_FREQUENCY): cv.string,
     }
 )
 SERVICE_DELETE_SCHEMA = COMMAND_SCHEMA.extend(
@@ -332,6 +339,7 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
         subdevice = kwargs[ATTR_DEVICE]
         toggle = kwargs[ATTR_ALTERNATIVE]
         is_rf = kwargs.get(ATTR_COMMAND_TYPE) == "rf"
+        rf_frequency = kwargs.get(ATTR_RF_FREQUENCY, DEFAULT_RF_FREQUENCY)
 
         if not self._storage_loaded:
             await self._async_load_storage()
@@ -340,29 +348,45 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
             should_store = False
 
             for command in commands:
-                code = await self._async_learn_command(command, is_rf=is_rf)
+                code = await self._async_learn_command(
+                    command, is_rf=is_rf, rf_frequency=rf_frequency
+                )
                 _LOGGER.info("Learning %s for %s: %s", command, subdevice, code)
                 if toggle:
-                    code = [code, await self._async_learn_command(command, is_rf=is_rf)]
+                    code = [
+                        code,
+                        await self._async_learn_command(
+                            command, is_rf=is_rf, rf_frequency=rf_frequency
+                        ),
+                    ]
                 self._codes.setdefault(subdevice, {}).update({command: code})
                 should_store = True
 
             if should_store:
                 await self._code_storage.async_save(self._codes)
 
-    async def _async_learn_command(self, command, is_rf=False):
-        """Learn a single command"""
+    async def _async_learn_command(
+        self, command, is_rf=False, rf_frequency=DEFAULT_RF_FREQUENCY
+    ):
+        """Learn a single command.
+
+        Args:
+            command:      Name of the button to learn.
+            is_rf:        True for RF sub-GHz learning, False for IR.
+            rf_frequency: RF carrier frequency string (e.g. "433.92", "315",
+                          "868").  Passed through to the hub's study_feq field.
+                          Defaults to DEFAULT_RF_FREQUENCY ("433.92 MHz").
+                          Using "0" is intentionally avoided: on S11+ firmware
+                          it causes the hub to exit study mode after ~15 s
+                          without capturing anything.
+        """
         service = f"{RM_DOMAIN}.{SERVICE_LEARN_COMMAND}"
         if is_rf:
-            # "0" causes the S11+ to exit study mode after ~15 s without
-            # capturing anything because the hub interprets it as "no
-            # frequency selected".  Specifying the actual RF carrier
-            # frequency keeps the receiver active for the full timeout.
             cmd_start = json.dumps(
                 {
                     "control": CMD_STUDYRF,
                     "rf_type": "sub_2g",
-                    "study_feq": "433.92",
+                    "study_feq": rf_frequency,
                     "ver": "2",
                 }
             )
@@ -370,7 +394,7 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
                 {
                     "control": CMD_ENDSTUDYRF,
                     "rf_type": "sub_2g",
-                    "study_feq": "433.92",
+                    "study_feq": rf_frequency,
                     "ver": "2",
                 }
             )
