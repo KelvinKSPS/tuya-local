@@ -108,8 +108,12 @@ def _make_remote(has_receive=True, has_control=False, has_delay=False, has_type=
     """Create a TuyaLocalRemote with mocked internals."""
     device = MagicMock()
     device._hass = MagicMock()
+    device._name = "Test Hub"
     device.unique_id = "test_remote_123"
+    device.dev_cid = None  # standalone device — not a gateway sub-device
+    device.dev_id = "hub_device_id"
     device.async_set_properties = AsyncMock()
+    device.async_refresh = AsyncMock()
     device.anticipate_property_value = MagicMock()
 
     remote = object.__new__(TuyaLocalRemote)
@@ -426,3 +430,157 @@ class TestAsyncLoadStorage:
         await remote._async_load_storage()
         assert remote._storage_loaded is True
         assert remote._codes == {}
+
+
+def _make_subdevice_remote():
+    """Create a TuyaLocalRemote that represents a gateway sub-device.
+
+    The parent hub TuyaLocalDevice is wired into hass.data[DOMAIN] so the
+    routing logic in async_send_command and _async_learn_command can resolve
+    it.
+    """
+    remote = _make_remote()
+
+    parent_device = MagicMock()
+    parent_device._name = "Parent Hub"
+    parent_device.async_set_properties = AsyncMock()
+    parent_device.async_refresh = AsyncMock()
+    parent_device.anticipate_property_value = MagicMock()
+
+    # Mark remote._device as a sub-device
+    remote._device.dev_cid = "sub_device_cid"
+    remote._device.dev_id = "hub_device_id"
+
+    # Wire parent into hass.data[DOMAIN]
+    domain_data = {
+        "hub_device_id": {"device": parent_device},
+    }
+    remote._device._hass.data = {DOMAIN: domain_data}
+
+    return remote, parent_device
+
+
+class TestAsyncSendCommandSubdevice:
+    """Tests for Bug 3: RF send must be routed via the parent hub on sub-devices."""
+
+    @pytest.mark.asyncio
+    async def test_rf_send_on_subdevice_routes_via_parent(self):
+        """rfstudy_send for a sub-device must go through the parent hub."""
+        remote, parent_device = _make_subdevice_remote()
+        remote._storage_loaded = True
+        remote._codes = {"gate_cid": {"power": "rf:BASE64CODE"}}
+
+        await remote.async_send_command(
+            ["power"], device="gate_cid", num_repeats=1
+        )
+
+        parent_device.async_set_properties.assert_awaited_once()
+        remote._device.async_set_properties.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ir_send_on_subdevice_uses_subdevice(self):
+        """IR send_command on a sub-device must NOT reroute to the parent hub."""
+        remote, parent_device = _make_subdevice_remote()
+        remote._storage_loaded = True
+        remote._codes = {"tv_cid": {"vol_up": "IR_CODE"}}
+
+        await remote.async_send_command(
+            ["vol_up"], device="tv_cid", num_repeats=1
+        )
+
+        remote._device.async_set_properties.assert_awaited_once()
+        parent_device.async_set_properties.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rf_send_standalone_uses_own_device(self):
+        """RF send on a standalone hub (no dev_cid) must not reroute."""
+        remote = _make_remote()
+        remote._storage_loaded = True
+        remote._codes = {"gate": {"power": "rf:BASE64CODE"}}
+        # dev_cid is None (set in _make_remote) — standalone hub
+
+        await remote.async_send_command(
+            ["power"], device="gate", num_repeats=1
+        )
+
+        remote._device.async_set_properties.assert_awaited_once()
+
+
+class TestAsyncLearnCommandRfSubdevice:
+    """Tests for Bug 1: RF learn must poll dp202 via the parent hub on sub-devices."""
+
+    @pytest.mark.asyncio
+    async def test_rf_learn_on_subdevice_sends_study_via_parent(self):
+        """For a sub-device, rf_study must be sent on the parent hub connection."""
+        remote, parent_device = _make_subdevice_remote()
+        remote._storage_loaded = True
+        remote._receive_dp.get_value.side_effect = [None, "RF_CODE"]
+
+        with patch("custom_components.tuya_local.remote.persistent_notification"):
+            with patch(
+                "custom_components.tuya_local.remote.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await remote.async_learn_command(
+                    command=["gate"],
+                    device="gate_cid",
+                    alternative=False,
+                    command_type="rf",
+                )
+
+        sent_to = [
+            call.args[0] for call in remote._send_dp.async_set_value.call_args_list
+        ]
+        for dev in sent_to:
+            assert dev is parent_device, (
+                "rf_study / rfstudy_exit must be sent via the parent hub"
+            )
+
+    @pytest.mark.asyncio
+    async def test_rf_learn_on_subdevice_polls_parent_for_dp202(self):
+        """dp202 get_value must be called with the parent hub device, not the sub-device."""
+        remote, parent_device = _make_subdevice_remote()
+        remote._storage_loaded = True
+        remote._receive_dp.get_value.side_effect = [None, "RF_CODE"]
+
+        with patch("custom_components.tuya_local.remote.persistent_notification"):
+            with patch(
+                "custom_components.tuya_local.remote.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await remote.async_learn_command(
+                    command=["gate"],
+                    device="gate_cid",
+                    alternative=False,
+                    command_type="rf",
+                )
+
+        # Every get_value call must use the parent hub, not the sub-device
+        for call in remote._receive_dp.get_value.call_args_list:
+            assert call.args[0] is parent_device, (
+                "dp202 polling must target the parent hub, not the sub-device"
+            )
+        assert remote._receive_dp.get_value.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_ir_learn_on_subdevice_still_uses_subdevice(self):
+        """IR learning on a sub-device must NOT reroute to the parent hub."""
+        remote, parent_device = _make_subdevice_remote()
+        remote._storage_loaded = True
+        remote._receive_dp.get_value.side_effect = [None, "IR_CODE"]
+
+        with patch("custom_components.tuya_local.remote.persistent_notification"):
+            with patch(
+                "custom_components.tuya_local.remote.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await remote.async_learn_command(
+                    command=["power"], device="tv_cid", alternative=False
+                )
+
+        sent_to = [
+            call.args[0] for call in remote._send_dp.async_set_value.call_args_list
+        ]
+        for dev in sent_to:
+            assert dev is remote._device
+        parent_device.async_refresh.assert_not_awaited()

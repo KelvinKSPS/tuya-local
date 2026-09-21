@@ -33,6 +33,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
+from . import DOMAIN
 from .device import TuyaLocalDevice
 from .entity import TuyaLocalEntity
 from .helpers.config import async_tuya_setup_platform
@@ -282,7 +283,24 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
                 code,
                 subdevice or "default device",
             )
-            await self._device.async_set_properties(dps_to_set)
+            # For RF commands on a sub-device: send via the parent hub (no
+            # dev_cid).  The gateway radio only fires when rfstudy_send
+            # arrives on the parent connection; it silently ACKs but does not
+            # transmit when the packet carries a dev_cid.
+            send_device = self._device
+            if code.startswith("rf:") and self._device.dev_cid:
+                parent_entry = self._device._hass.data.get(DOMAIN, {}).get(
+                    self._device.dev_id, {}
+                )
+                parent_dev = parent_entry.get("device")
+                if parent_dev is not None:
+                    _LOGGER.debug(
+                        "%s RF send: routing via parent hub (%s)",
+                        self._config.config_id,
+                        self._device.dev_id,
+                    )
+                    send_device = parent_dev
+            await send_device.async_set_properties(dps_to_set)
 
             if len(codes) > 1:
                 self._flags[subdevice] ^= 1
@@ -336,6 +354,26 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
                     "ver": "2",
                 }
             )
+        # For RF learning on a sub-device (dev_cid), the gateway hub only
+        # pushes the captured code (dp 202) on the *parent* connection (the
+        # one without dev_cid).  Polling dp 202 on the sub-device connection
+        # always times out.  Resolve the parent TuyaLocalDevice so we can
+        # send study commands and poll dp 202 there.
+        rf_poll_device = self._device
+        if is_rf and self._device.dev_cid:
+            parent_entry = self._device._hass.data.get(DOMAIN, {}).get(
+                self._device.dev_id, {}
+            )
+            parent_local_device = parent_entry.get("device")
+            if parent_local_device is not None:
+                _LOGGER.debug(
+                    "%s is a sub-device; using parent hub (%s) for RF "
+                    "study commands and dp202 polling",
+                    self._config.config_id,
+                    self._device.dev_id,
+                )
+                rf_poll_device = parent_local_device
+
         if self._control_dp:
             _LOGGER.debug(
                 "%s starting learning %s using multi dps method",
@@ -345,11 +383,12 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
             await self._control_dp.async_set_value(self._device, CMD_LEARN)
         elif is_rf:
             _LOGGER.debug(
-                "%s starting learning %s using RF",
+                "%s starting learning %s using RF via %s",
                 self._config.config_id,
                 command,
+                rf_poll_device._name,
             )
-            await self._send_dp.async_set_value(self._device, cmd_start)
+            await self._send_dp.async_set_value(rf_poll_device, cmd_start)
         else:
             _LOGGER.debug(
                 "%s starting learning %s using IR",
@@ -371,7 +410,9 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
             start_time = dt_util.utcnow()
             while (dt_util.utcnow() - start_time) < LEARNING_TIMEOUT:
                 await asyncio.sleep(1)
-                code = self._receive_dp.get_value(self._device)
+                # For RF sub-devices, poll the parent hub (rf_poll_device)
+                # since dp202 is only returned on the parent connection.
+                code = self._receive_dp.get_value(rf_poll_device)
                 if code is not None:
                     _LOGGER.info(
                         "%s received code for %s: %s",
@@ -379,7 +420,9 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
                         command,
                         code,
                     )
-                    self._device.anticipate_property_value(self._receive_dp.id, None)
+                    rf_poll_device.anticipate_property_value(
+                        self._receive_dp.id, None
+                    )
                     return "rf:" + code if is_rf else code
             _LOGGER.warning("Timed out without receiving code in %s", service)
             raise TimeoutError(
@@ -397,7 +440,7 @@ class TuyaLocalRemote(TuyaLocalEntity, RemoteEntity):
                     CMD_ENDLEARN,
                 )
             elif is_rf:
-                await self._send_dp.async_set_value(self._device, cmd_end)
+                await self._send_dp.async_set_value(rf_poll_device, cmd_end)
             else:
                 await self._send_dp.async_set_value(
                     self._device,
